@@ -67,6 +67,26 @@ _FOOD_FALLBACK_QUERIES = [
 ]
 
 
+def _fit_bg_audio_to_duration(bg_audio: Any, target_duration: float, afx: Any) -> Any:
+    """Return background audio safely fitted to target duration.
+
+    ``AudioFileClip.set_duration`` can cause out-of-range reads when the clip
+    is shorter than the requested duration. Loop short clips and trim long ones
+    to keep frame access in-bounds during render.
+    """
+    if target_duration <= 0:
+        return bg_audio
+
+    clip_duration = getattr(bg_audio, "duration", 0.0) or 0.0
+    if clip_duration <= 0:
+        return bg_audio.set_duration(target_duration)
+    if clip_duration < target_duration:
+        return bg_audio.fx(afx.audio_loop, duration=target_duration)
+    if clip_duration > target_duration:
+        return bg_audio.subclip(0, target_duration)
+    return bg_audio
+
+
 def _pexels_headers() -> dict[str, str]:
     """Return the Pexels API authorisation header."""
     if not config.PEXELS_API_KEY:
@@ -608,6 +628,7 @@ def create_video(
             ColorClip,
             ImageClip,
             VideoFileClip,
+            afx,
             concatenate_videoclips,
         )
     except ImportError as exc:
@@ -737,11 +758,8 @@ def create_video(
         if effective_music_path.exists() and config.BG_MUSIC_VOLUME > 0:
             try:
                 fade_dur = getattr(config, "MUSIC_FADE_DURATION", 1.0)
-                bg_audio = (
-                    AudioFileClip(str(effective_music_path))
-                    .volumex(config.BG_MUSIC_VOLUME)
-                    .set_duration(target_duration)
-                )
+                bg_audio = AudioFileClip(str(effective_music_path)).volumex(config.BG_MUSIC_VOLUME)
+                bg_audio = _fit_bg_audio_to_duration(bg_audio, target_duration, afx)
                 bg_audio = bg_audio.audio_fadein(fade_dur).audio_fadeout(fade_dur * 2)
                 mixed_audio = CompositeAudioClip([bg_audio, tts_audio])
                 base = base.set_audio(mixed_audio)
