@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: funny-animation-shorts
-  cancel-in-progress: false  # Let the running job finish; queue at most one
+  cancel-in-progress: true  # Cancel stale runs so only the latest execution continues
 
 jobs:
   funny-animation-shorts:
@@ -29,8 +29,13 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg imagemagick fonts-liberation
+          if command -v ffmpeg >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 && \
+             command -v fc-list >/dev/null 2>&1 && fc-list | grep -qi "Liberation Sans"; then
+            echo "System dependencies already available; skipping apt install."
+          else
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg imagemagick fonts-liberation
+          fi
 
       - name: Fix ImageMagick security policy for MoviePy text rendering
         run: |
@@ -40,7 +45,7 @@ jobs:
           fi
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Run Funny Animation Shorts Factory pipeline
         env:
