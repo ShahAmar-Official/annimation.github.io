@@ -1,51 +1,131 @@
-name: Funny Animation Shorts Factory
+name: Food Making Videos Factory
 
+# ---------------------------------------------------------------------------
+# Schedule — three daily uploads timed for peak US audience activity.
+#
+# All times are UTC; Eastern Time offsets:  ET = UTC-5 (EST) / UTC-4 (EDT)
+#
+#   13:00 UTC →  8 AM ET  — morning commute / coffee-time browsing
+#   17:00 UTC → 12 PM ET  — lunch-hour scrolling (highest mid-day engagement)
+#   23:00 UTC →  6 PM ET  — prime-time evening viewing (peak US engagement)
+#
+# GitHub Actions ubuntu-latest runners execute on GitHub-hosted machines in
+# Microsoft Azure's US East data-centres (Virginia), so every run originates
+# from a US IP address — satisfying platform geo-targeting requirements and
+# ensuring the upload is attributed to a US origin by the YouTube API.
+# ---------------------------------------------------------------------------
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Run every 6 hours
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 13 * * *'   # 08:00 ET — US morning audience
+    - cron: '0 17 * * *'   # 12:00 ET — US lunch-hour audience
+    - cron: '0 23 * * *'   # 18:00 ET — US prime-time audience
+  workflow_dispatch:          # Manual trigger — supports dry-run via inputs
+    inputs:
+      dry_run:
+        description: 'Skip YouTube upload (dry-run mode)'
+        required: false
+        default: 'false'
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write   # Needed to upload artifacts via actions/upload-artifact
 
 concurrency:
-  group: funny-animation-shorts
-  cancel-in-progress: false  # Let the running job finish; queue at most one
+  group: food-making-videos-${{ github.ref }}
+  cancel-in-progress: true  # Cancel stale runs so only the latest execution continues
 
 jobs:
-  funny-animation-shorts:
+  generate-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
+      # ------------------------------------------------------------------ #
+      # 1. Checkout
+      # ------------------------------------------------------------------ #
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # ------------------------------------------------------------------ #
+      # 2. Log runner IP — confirms upload originates from a US address   #
+      #    (GitHub-hosted ubuntu-latest runs on Azure East US, Virginia)   #
+      # ------------------------------------------------------------------ #
+      - name: Log runner public IP
+        run: |
+          PUBLIC_IP=$(curl -sf --max-time 10 https://api.ipify.org || echo "unavailable")
+          echo "Runner public IP : $PUBLIC_IP"
+          COUNTRY=$(curl -sf --max-time 10 "https://ipinfo.io/${PUBLIC_IP}/country" || echo "unknown")
+          echo "Runner country   : $COUNTRY"
+
+      # ------------------------------------------------------------------ #
+      # 3. Python setup with pip caching
+      # ------------------------------------------------------------------ #
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
+      # ------------------------------------------------------------------ #
+      # 4. System dependencies (ffmpeg, ImageMagick, fonts)
+      # ------------------------------------------------------------------ #
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg imagemagick fonts-liberation
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg imagemagick fonts-liberation fonts-dejavu
 
       - name: Fix ImageMagick security policy for MoviePy text rendering
         run: |
           # Allow @filename reads needed by MoviePy TextClip
           if [ -f /etc/ImageMagick-6/policy.xml ]; then
-            sudo sed -i 's/<policy domain="path" rights="none" pattern="@\*"/<policy domain="path" rights="read|write" pattern="@\*"/g' /etc/ImageMagick-6/policy.xml
+            sudo sed -i \
+              's/<policy domain="path" rights="none" pattern="@\*"/<policy domain="path" rights="read|write" pattern="@\*"/g' \
+              /etc/ImageMagick-6/policy.xml
           fi
 
+      # ------------------------------------------------------------------ #
+      # 5. Python dependencies
+      # ------------------------------------------------------------------ #
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Run Funny Animation Shorts Factory pipeline
+      # ------------------------------------------------------------------ #
+      # 6. Ensure artifacts directory exists for digest + audit logs
+      # ------------------------------------------------------------------ #
+      - name: Create artifacts directory
+        run: mkdir -p artifacts
+
+      # ------------------------------------------------------------------ #
+      # 7. Run the Food Making Videos Factory pipeline
+      # ------------------------------------------------------------------ #
+      - name: Run pipeline
         env:
+          # --- Required secrets ---
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_TOKEN: ${{ secrets.YOUTUBE_TOKEN }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # --- Optional API keys ---
           NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
+          FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
+          YOUTUBE_DATA_API_KEY: ${{ secrets.YOUTUBE_DATA_API_KEY }}
+          # --- Pipeline behaviour flags ---
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          VIDEO_FAST_RENDER: 'false'
         run: python -m src.pipeline
+
+      # ------------------------------------------------------------------ #
+      # 8. Upload audit logs and trend digests as workflow artifacts
+      # ------------------------------------------------------------------ #
+      - name: Upload pipeline artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-artifacts-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+

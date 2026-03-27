@@ -1,262 +1,153 @@
-"""
-uploader.py — Upload videos to YouTube via the Data API v3.
+"""uploader.py — YouTube credential validation and video upload helpers."""
 
-Credentials are loaded from environment variables (JSON strings) so that
-no OAuth2 files need to exist on disk in CI.
-"""
+from __future__ import annotations
 
 import json
-import logging
-import time
 from pathlib import Path
+from typing import Any
 
 import config
 
-logger = logging.getLogger(__name__)
-
-_MAX_RETRIES = 3
-_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB resumable upload chunks
-
-# OAuth error codes that indicate a permanent credential problem.  Retrying
-# with the same credentials will never succeed — the user must re-authorise.
-_FATAL_OAUTH_ERRORS = frozenset({"invalid_scope", "invalid_grant", "invalid_client"})
-
-_REAUTH_HINT = (
-    "Your YouTube OAuth2 credentials are invalid or expired.  To fix this:\n"
-    "  1. Re-run the OAuth2 authorization flow (see README - Quick Start).\n"
-    "  2. Update the YOUTUBE_TOKEN GitHub Secret with the new token JSON.\n"
-    "  3. Re-run the pipeline."
-)
+# Scopes required when running the one-time OAuth2 authorisation flow (see README Step 3).
+# These must NOT be passed to Credentials() during a token refresh — Google's token endpoint
+# rejects refresh requests that include a scope parameter and responds with invalid_scope.
+_YOUTUBE_SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube",
+]
 
 
 def _is_fatal_oauth_error(exc: Exception) -> bool:
-    """Return ``True`` if *exc* is a credential error that will never succeed on retry."""
+    """Return True when *exc* indicates non-retriable OAuth credential issues."""
     msg = str(exc).lower()
-    return any(code in msg for code in _FATAL_OAUTH_ERRORS)
+    return any(marker in msg for marker in ("invalid_scope", "invalid_grant", "invalid_client"))
 
 
-def _build_credentials() -> "google.oauth2.credentials.Credentials":  # type: ignore[name-defined]
-    """Build OAuth2 credentials from the environment variable JSON strings.
-
-    Raises:
-        RuntimeError: If the required environment variables are missing or
-            contain invalid JSON.
-    """
+def _parse_json_env(var_name: str, raw: str | None) -> dict[str, Any]:
+    """Parse JSON from environment-backed config values with actionable errors."""
+    if not raw:
+        raise RuntimeError(f"{var_name} is missing. Set {var_name} in environment/GitHub Secrets.")
     try:
-        from google.oauth2.credentials import Credentials  # type: ignore[import]
-        from google.auth.transport.requests import Request  # type: ignore[import]
-    except ImportError as exc:
-        raise RuntimeError("google-auth package is not installed") from exc
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"{var_name} contains invalid JSON.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{var_name} must be a JSON object.")
+    return data
 
-    client_secret_raw = config.YOUTUBE_CLIENT_SECRET_JSON
-    token_raw = config.YOUTUBE_TOKEN_JSON
 
-    if not client_secret_raw:
-        raise RuntimeError("YOUTUBE_CLIENT_SECRET environment variable is not set")
-    if not token_raw:
-        raise RuntimeError("YOUTUBE_TOKEN environment variable is not set")
+def _build_credentials() -> Any:
+    """Build and refresh Google OAuth2 credentials from configured JSON blobs."""
+    client_secret_root = _parse_json_env("YOUTUBE_CLIENT_SECRET", config.YOUTUBE_CLIENT_SECRET_JSON)
+    token_data = _parse_json_env("YOUTUBE_TOKEN", config.YOUTUBE_TOKEN_JSON)
 
-    try:
-        client_info = json.loads(client_secret_raw)
-        app_info = client_info.get("installed") or client_info.get("web") or client_info
-        client_id = app_info["client_id"]
-        client_secret = app_info["client_secret"]
-        token_uri = app_info.get("token_uri", "https://oauth2.googleapis.com/token")
-    except (KeyError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Invalid YOUTUBE_CLIENT_SECRET JSON: {exc}") from exc
-
-    try:
-        token_info = json.loads(token_raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid YOUTUBE_TOKEN JSON: {exc}") from exc
-
-    creds = Credentials(
-        token=token_info.get("access_token") or token_info.get("token"),
-        refresh_token=token_info.get("refresh_token"),
-        client_id=client_id,
-        client_secret=client_secret,
-        token_uri=token_uri,
+    client_secret = (
+        client_secret_root.get("installed")
+        or client_secret_root.get("web")
+        or client_secret_root
     )
 
-    if not creds.refresh_token:
-        raise RuntimeError(
-            "YOUTUBE_TOKEN contains no refresh_token — the stored credential "
-            "is incomplete.\n" + _REAUTH_HINT
-        )
+    try:
+        from google.auth.transport.requests import Request  # type: ignore[import]
+        from google.oauth2.credentials import Credentials  # type: ignore[import]
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("Google auth libraries are not installed.") from exc
+
+    creds = Credentials(
+        token=token_data.get("access_token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri") or client_secret.get("token_uri"),
+        client_id=client_secret.get("client_id"),
+        client_secret=client_secret.get("client_secret"),
+        # Do NOT pass scopes here.  The OAuth2 refresh-token grant does not accept
+        # a scope parameter; sending one causes Google to respond with invalid_scope.
+        # The refreshed access token automatically carries the same scopes that were
+        # granted during the original authorisation flow.
+    )
+
+    if not getattr(creds, "refresh_token", None):
+        raise RuntimeError("YOUTUBE_TOKEN is missing refresh_token. Re-authorize and update YOUTUBE_TOKEN.")
 
     try:
         creds.refresh(Request())
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"OAuth2 token refresh failed: {exc}\n{_REAUTH_HINT}"
-        ) from exc
+        msg = str(exc).lower()
+        if "invalid_scope" in msg:
+            hint = (
+                "OAuth2 token refresh failed (invalid_scope). "
+                "Re-run the authorisation flow with the correct scopes and update YOUTUBE_TOKEN."
+            )
+        elif "invalid_grant" in msg:
+            hint = (
+                "OAuth2 token refresh failed (invalid_grant). "
+                "The refresh token has been revoked or expired. Re-authorize and update YOUTUBE_TOKEN."
+            )
+        else:
+            hint = "OAuth2 token refresh failed. Re-run auth flow and update YOUTUBE_TOKEN."
+        raise RuntimeError(hint) from exc
 
-    creds._scopes = None           # type: ignore[attr-defined]
-    creds._granted_scopes = None   # type: ignore[attr-defined]
-    logger.info("OAuth2 token refreshed successfully")
-
+    # Ensure downstream Google client does not fail on immutable scope objects.
+    setattr(creds, "_scopes", None)
+    setattr(creds, "_granted_scopes", None)
     return creds
 
 
-def validate_credentials() -> None:
-    """Validate that the YouTube OAuth2 credentials are working.
-
-    Builds credentials, refreshes the token, then makes a cheap API call
-    (``channels.list mine=True``) to confirm authentication is working.
-
-    Raises:
-        RuntimeError: If credentials are missing, invalid, or the API call fails.
-    """
+def _build_youtube_service() -> Any:
+    """Create an authenticated YouTube Data API service client."""
     try:
         from googleapiclient.discovery import build  # type: ignore[import]
-    except ImportError as exc:
-        raise RuntimeError("google-api-python-client is not installed") from exc
-
-    creds = _build_credentials()
-    youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
-
-    try:
-        response = youtube.channels().list(part="id", mine=True).execute()
-        items = response.get("items", [])
-        if items:
-            logger.info("Credentials valid — authenticated as channel: %s", items[0]["id"])
-        else:
-            logger.warning(
-                "Credentials valid but no channels found — ensure the OAuth "
-                "token was authorized by a YouTube channel owner account."
-            )
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"YouTube API credential check failed: {exc}\n{_REAUTH_HINT}"
-        ) from exc
+        raise RuntimeError("google-api-python-client is not installed.") from exc
+    return build("youtube", "v3", credentials=_build_credentials(), cache_discovery=False)
 
 
-def upload_video(
-    video_path: Path,
-    title: str,
-    description: str,
-    tags: list[str],
-    category_id: str = config.YOUTUBE_CATEGORY_ID,
-    privacy_status: str = config.PRIVACY_STATUS,
-    thumbnail_path: Path | None = None,
-) -> tuple[str, str]:
-    """Upload a video to YouTube and optionally set its thumbnail.
-
-    Args:
-        video_path: Path to the MP4 video file.
-        title: Video title (max 100 characters).
-        description: Video description.
-        tags: List of tag strings.
-        category_id: YouTube category ID string (default: ``"22"`` = People & Blogs).
-        privacy_status: ``"public"``, ``"unlisted"``, or ``"private"``.
-        thumbnail_path: Optional path to a JPEG thumbnail file.
-
-    Returns:
-        A tuple of ``(video_id, video_url)``.
-
-    Raises:
-        RuntimeError: If the upload fails after all retries.
-    """
+def validate_credentials() -> None:
+    """Fail fast if YouTube credentials are invalid or channel access is missing."""
     try:
-        from googleapiclient.discovery import build  # type: ignore[import]
+        youtube = _build_youtube_service()
+        response = youtube.channels().list(part="id", mine=True).execute()
+        if not response.get("items"):
+            raise RuntimeError("No YouTube channel found for authenticated account.")
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"YouTube credential check failed: {exc}") from exc
+
+
+def upload_video(video_path: Path | str, title: str, description: str, tags: list[str]) -> tuple[str, str]:
+    """Upload a video file to YouTube and return ``(video_id, video_url)``."""
+    path = Path(video_path)
+    if not path.exists():
+        raise RuntimeError(f"Video file not found: {path}")
+
+    try:
         from googleapiclient.http import MediaFileUpload  # type: ignore[import]
-        from googleapiclient.errors import HttpError  # type: ignore[import]
-    except ImportError as exc:
-        raise RuntimeError("google-api-python-client is not installed") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("google-api-python-client is not installed.") from exc
 
-    creds = _build_credentials()
-    youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
-
+    youtube = _build_youtube_service()
     body = {
         "snippet": {
-            "title": title[:100],
+            "title": title,
             "description": description,
             "tags": tags,
-            "categoryId": category_id,
+            "categoryId": str(config.YOUTUBE_CATEGORY_ID),
         },
-        "status": {
-            "privacyStatus": privacy_status,
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": {"privacyStatus": config.PRIVACY_STATUS},
     }
 
-    media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True, chunksize=_CHUNK_SIZE)
-
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            logger.info("Uploading video (attempt %d/%d): '%s'", attempt, _MAX_RETRIES, title)
-            request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-            response = None
-            while response is None:
-                status, response = request.next_chunk()
-                if status:
-                    logger.debug("Upload progress: %.0f%%", status.progress() * 100)
-
-            video_id: str = response["id"]
-            video_url = f"https://www.youtube.com/shorts/{video_id}"
-            logger.info("Video uploaded successfully: %s", video_url)
-
-            if thumbnail_path and thumbnail_path.exists():
-                _set_thumbnail(youtube, video_id, thumbnail_path)
-
-            return video_id, video_url
-
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Upload attempt %d/%d failed: %s", attempt, _MAX_RETRIES, exc)
-            if _is_fatal_oauth_error(exc):
-                raise RuntimeError(
-                    f"Upload failed due to a permanent credential error: {exc}\n"
-                    f"{_REAUTH_HINT}"
-                ) from exc
-            if attempt < _MAX_RETRIES:
-                time.sleep(2**attempt)
-
-    raise RuntimeError(f"Video upload failed after {_MAX_RETRIES} attempts: '{title}'")
-
-
-def _set_thumbnail(youtube: object, video_id: str, thumbnail_path: Path) -> None:
-    """Attach *thumbnail_path* to the already-uploaded *video_id*."""
     try:
-        from googleapiclient.discovery import build  # type: ignore[import]
-        from googleapiclient.http import MediaFileUpload  # type: ignore[import]
-        from googleapiclient.errors import HttpError  # type: ignore[import]
-    except ImportError:
-        logger.warning("google-api-python-client not available; skipping thumbnail")
-        return
-
-    _THUMBNAIL_RETRY_DELAYS = [10, 30, 60]
-
-    for attempt, delay in enumerate(_THUMBNAIL_RETRY_DELAYS, start=1):
-        try:
-            logger.info("Waiting %d s before setting thumbnail (attempt %d/%d)…",
-                        delay, attempt, len(_THUMBNAIL_RETRY_DELAYS))
-            time.sleep(delay)
-
-            fresh_creds = _build_credentials()
-            fresh_youtube = build("youtube", "v3", credentials=fresh_creds,
-                                  cache_discovery=False)
-
-            fresh_media = MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg")
-            fresh_youtube.thumbnails().set(
-                videoId=video_id, media_body=fresh_media
-            ).execute()
-            logger.info("Thumbnail set for video %s", video_id)
-            return
-        except HttpError as exc:
-            status = exc.resp.status if hasattr(exc, "resp") else "unknown"
-            logger.warning(
-                "Thumbnail attempt %d/%d failed (HTTP %s): %s. "
-                "If 403, ensure the channel has custom thumbnails enabled "
-                "(requires phone verification) and the OAuth token includes "
-                "the youtube.force-ssl scope.",
-                attempt, len(_THUMBNAIL_RETRY_DELAYS), status, exc,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Thumbnail attempt %d/%d failed: %s",
-                           attempt, len(_THUMBNAIL_RETRY_DELAYS), exc)
-
-    logger.warning(
-        "Failed to set thumbnail for video %s after %d attempts. "
-        "The video was uploaded successfully — thumbnail can be set manually.",
-        video_id, len(_THUMBNAIL_RETRY_DELAYS),
-    )
+        request = youtube.videos().insert(
+            part="snippet,status",
+            body=body,
+            media_body=MediaFileUpload(str(path), resumable=True, mimetype="video/mp4"),
+        )
+        response = request.execute()
+        video_id = response.get("id")
+        if not video_id:
+            raise RuntimeError("YouTube API did not return a video id.")
+        return video_id, f"https://www.youtube.com/watch?v={video_id}"
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"YouTube upload failed: {exc}") from exc

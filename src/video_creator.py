@@ -1,17 +1,17 @@
 """
-video_creator.py — Build a vertical YouTube Shorts video for the Funny Animation Shorts Factory.
+video_creator.py — Build a vertical YouTube Shorts video for the Food Making Videos Factory.
 
-Assembles animation-style footage from the Pexels API, TTS audio, and
-animated meme-style captions using MoviePy.
+Assembles food footage from multiple stock media sources (Pexels, Pixabay, Unsplash),
+TTS audio, and bold captions using MoviePy.
 
 Workflow:
-1. Fetch cartoon/animation stock video clips from the Pexels API for each scene.
-2. Resize / crop each clip to 1080 × 1920 (portrait).
-3. Apply animation-style colour grading (brighter, more saturated).
-4. Concatenate clips with crossfade transitions.
-5. Overlay TTS audio with optional background music.
-6. Burn bold meme-style captions with neon pill backgrounds.
-7. Apply comic-style speed ramps (speed up mundane moments, slow for punchlines).
+1. Fetch food-themed stock video clips from rotating stock sources (Pexels, Pixabay) for each scene.
+2. Use Unsplash as fallback for high-quality food photography with Ken Burns effect.
+3. Resize / crop each clip to 1080 × 1920 (portrait).
+4. Apply warm, vibrant colour grading for food appeal.
+5. Concatenate clips with crossfade transitions.
+6. Overlay TTS audio with optional background music.
+7. Burn bold, engaging captions with warm pill backgrounds.
 8. Apply fade-in / fade-out.
 9. Export as high-quality H.264/AAC MP4.
 """
@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import random
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -44,26 +45,149 @@ logger = logging.getLogger(__name__)
 
 _PEXELS_VIDEO_SEARCH = "https://api.pexels.com/videos/search"
 _PEXELS_IMAGE_SEARCH = "https://api.pexels.com/v1/search"
+_PIXABAY_VIDEO_SEARCH = "https://pixabay.com/api/videos/"
+_PIXABAY_IMAGE_SEARCH = "https://pixabay.com/api/"
+_UNSPLASH_SEARCH = "https://api.unsplash.com/search/photos"
 
 # ---------------------------------------------------------------------------
-# Animation-themed Pexels search query suffixes — appended to scene descriptions
-# to prefer cartoon-like, colourful, and animated-looking stock footage.
+# Food-themed search query suffixes — appended to scene descriptions to prefer
+# close-up food photography, cooking action shots, and kitchen environments.
 # ---------------------------------------------------------------------------
-_ANIMATION_QUERY_SUFFIXES = ["cartoon", "animated", "colorful", "comic", "fun"]
-_ANIMATION_FALLBACK_QUERIES = [
-    "cartoon animation colorful",
-    "funny animation cartoon",
-    "colorful animated character",
-    "comedy sketch colorful",
-    "animated background colorful",
-    "cute cartoon character",
-    "funny colorful background",
+_FOOD_QUERY_SUFFIXES = ["food", "cooking", "recipe", "kitchen", "chef"]
+_FOOD_FALLBACK_QUERIES = [
+    "food cooking close up",
+    "chef cooking kitchen",
+    "fresh ingredients recipe",
+    "delicious food preparation",
+    "cooking pan sizzle",
+    "food plating presentation",
+    "kitchen cooking tutorial",
+    "fresh vegetables cutting",
+    "meat grilling cooking",
+    "baking bread oven",
 ]
 
 
+def _fit_bg_audio_to_duration(bg_audio: Any, target_duration: float, afx: Any) -> Any:
+    """Return background audio safely fitted to target duration.
+
+    ``AudioFileClip.set_duration`` can cause out-of-range reads when the clip
+    is shorter than the requested duration. Loop short clips and trim long ones
+    to keep frame access in-bounds during render.
+    """
+    if target_duration <= 0:
+        return bg_audio
+
+    clip_duration = getattr(bg_audio, "duration", 0.0) or 0.0
+    if clip_duration <= 0:
+        return bg_audio.set_duration(target_duration)
+    if clip_duration < target_duration:
+        return bg_audio.fx(afx.audio_loop, duration=target_duration)
+    if clip_duration > target_duration:
+        return bg_audio.subclip(0, target_duration)
+    return bg_audio
+
+
+def _resolve_target_duration(
+    requested_audio_duration: float,
+    default_duration: float,
+    measured_tts_duration: float | None,
+) -> float:
+    """Resolve final video duration so narration is never cut short."""
+    resolved = requested_audio_duration if requested_audio_duration > 0 else default_duration
+    if measured_tts_duration and measured_tts_duration > 0:
+        resolved = max(resolved, measured_tts_duration)
+    return resolved
+
+
 # ---------------------------------------------------------------------------
-# Pexels helpers
+# Clip safety helpers — prevent "bytes wanted but 0 bytes read" MoviePy warning
 # ---------------------------------------------------------------------------
+
+# Seconds trimmed from the tail of every downloaded video clip.  MP4 containers
+# obtained from stock-footage APIs sometimes report a duration that exceeds the
+# number of frames that ffmpeg can actually decode (truncated-tail artifact).
+# MoviePy's ffmpeg_reader then emits a UserWarning when it reaches the
+# unreadable tail: "N bytes wanted but 0 bytes read … using last valid frame".
+# Trimming this small buffer keeps all frame reads comfortably in-bounds without
+# any visible impact on the looped / subclipped footage used by the pipeline.
+_CLIP_TAIL_TRIM_S: float = 0.1
+
+
+def _probe_video_duration(path: Path) -> float | None:
+    """Return the video-stream duration reported by ffprobe, or ``None`` on failure.
+
+    Queries the ``v:0`` stream duration directly.  This is more reliable than
+    the container-level duration that MoviePy reads from the MP4 header, which
+    can be inflated by a few frames when the encoder did not flush the container
+    correctly (the root cause of the "bytes wanted but 0 bytes read" warning).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        val = result.stdout.strip()
+        if val and val.lower() != "n/a":
+            return float(val)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _load_safe_video_clip(VideoFileClip: Any, path: Path, audio: bool = False) -> Any:
+    """Load a ``VideoFileClip`` and trim its tail to eliminate truncated-frame warnings.
+
+    Stock-footage MP4 files sometimes have a container duration that exceeds
+    the number of actually-decodable frames.  When MoviePy's ffmpeg_reader
+    attempts to read those phantom frames it logs::
+
+        UserWarning: Warning: in file <path>, N bytes wanted but 0 bytes read,
+        at frame X/Y … Using the last valid frame instead.
+
+    This function fixes the issue permanently by:
+
+    1. Loading the clip via ``VideoFileClip``.
+    2. Probing the true stream duration with ``ffprobe`` (more accurate than the
+       container metadata MoviePy relies on).
+    3. Trimming to ``min(moviepy_duration, ffprobe_duration) − _CLIP_TAIL_TRIM_S``
+       so the ffmpeg reader never reaches the potentially-incomplete tail.
+
+    The ``_CLIP_TAIL_TRIM_S`` buffer (0.1 s) is visually imperceptible because
+    all clips are subsequently looped or subclipped to the exact scene duration.
+    """
+    vc = VideoFileClip(str(path), audio=audio)
+
+    probed = _probe_video_duration(path)
+    safe_end = vc.duration
+    if probed is not None and probed < vc.duration:
+        safe_end = probed
+
+    safe_end -= _CLIP_TAIL_TRIM_S
+    if 0 < safe_end < vc.duration:
+        vc = vc.subclip(0, safe_end)
+
+    return vc
+
+
+def _fit_base_video_duration(base: Any, target_duration: float, vfx: Any) -> Any:
+    """Ensure visual timeline fully covers narration duration."""
+    if base.duration < target_duration:
+        freeze_duration = target_duration - base.duration
+        return base.fx(vfx.freeze, t=max(base.duration - 0.05, 0), freeze_duration=freeze_duration)
+    if base.duration > target_duration:
+        return base.subclip(0, target_duration)
+    return base
+
+
 def _pexels_headers() -> dict[str, str]:
     """Return the Pexels API authorisation header."""
     if not config.PEXELS_API_KEY:
@@ -71,15 +195,15 @@ def _pexels_headers() -> dict[str, str]:
     return {"Authorization": config.PEXELS_API_KEY}
 
 
-def _make_animation_query(scene: str) -> str:
-    """Build an animation-themed Pexels search query from a scene description.
+def _make_food_query(scene: str) -> str:
+    """Build a food-themed search query from a scene description.
 
-    Appends a rotation of animation-friendly suffix keywords so the returned
-    footage looks more cartoon-like and colourful rather than generic stock.
+    Appends a rotation of food-friendly suffix keywords so returned
+    footage shows cooking, ingredients, and food preparation.
     The suffix rotates hourly for variety across runs.
     """
-    suffix = _ANIMATION_QUERY_SUFFIXES[int(math.floor(
-        (len(scene) + int(__import__("time").time()) // 3600) % len(_ANIMATION_QUERY_SUFFIXES)
+    suffix = _FOOD_QUERY_SUFFIXES[int(math.floor(
+        (len(scene) + int(__import__("time").time()) // 3600) % len(_FOOD_QUERY_SUFFIXES)
     ))]
     # Strip scene descriptions to a short, searchable phrase
     words = scene.split()[:6]
@@ -90,8 +214,8 @@ def _make_animation_query(scene: str) -> str:
 def _search_pexels_video(query: str, per_page: int = 5) -> list[str]:
     """Return a list of downloadable video URLs from Pexels for *query*.
 
-    Tries the animation-themed query first; if fewer than 2 results come
-    back, falls back to a broader animation fallback query.  Prefers the
+    Tries the food-themed query first; if fewer than 2 results come
+    back, falls back to a broader food fallback query.  Prefers the
     highest-resolution HD file for each video result.
     """
     per_page = getattr(config, "PEXELS_PER_PAGE", per_page)
@@ -129,30 +253,76 @@ def _search_pexels_video(query: str, per_page: int = 5) -> list[str]:
             logger.warning("Pexels video search failed for '%s': %s", q, exc)
             return []
 
-    # Try the scene query first
-    animation_query = _make_animation_query(query)
-    urls = _fetch(animation_query)
+    # Try the food query first
+    food_query = _make_food_query(query)
+    urls = _fetch(food_query)
 
-    # If insufficient results, try a broader animation fallback
+    # If insufficient results, try Pixabay as secondary source
     if len(urls) < 2:
-        fallback_q = random.choice(_ANIMATION_FALLBACK_QUERIES)
-        logger.info("Broadening Pexels search from '%s' to '%s'", animation_query, fallback_q)
+        pixabay_urls = _search_pixabay_video(food_query, per_page=3)
+        if pixabay_urls:
+            logger.info("Using Pixabay as secondary source for '%s'", food_query)
+            urls = pixabay_urls + urls
+
+    # If still insufficient, try a broader food fallback
+    if len(urls) < 2:
+        fallback_q = random.choice(_FOOD_FALLBACK_QUERIES)
+        logger.info("Broadening search from '%s' to '%s'", food_query, fallback_q)
         urls = _fetch(fallback_q) or urls
 
     return urls
 
 
+def _search_pixabay_video(query: str, per_page: int = 5) -> list[str]:
+    """Search Pixabay for food-related portrait videos matching *query*.
+
+    Requires ``PIXABAY_API_KEY`` to be set; returns empty list gracefully
+    if the key is absent or the request fails.
+    """
+    api_key = getattr(config, "PIXABAY_API_KEY", None)
+    if not api_key:
+        return []
+    try:
+        resp = requests.get(
+            _PIXABAY_VIDEO_SEARCH,
+            params={
+                "key": api_key,
+                "q": query,
+                "video_type": "film",
+                "per_page": per_page,
+                "safesearch": "true",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        urls: list[str] = []
+        for hit in data.get("hits", []):
+            videos = hit.get("videos", {})
+            for quality in ("medium", "small", "large", "tiny"):
+                video_data = videos.get(quality, {})
+                url = video_data.get("url")
+                if url:
+                    urls.append(url)
+                    break
+        logger.debug("Pixabay video search for '%s': %d results", query, len(urls))
+        return urls
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Pixabay video search failed for '%s': %s", query, exc)
+        return []
+
+
 def _search_pexels_image(query: str) -> str | None:
     """Return the URL of a portrait photo from Pexels for *query*.
 
-    Prefers colourful / animation-friendly imagery by appending "colorful".
+    Prefers food-vibrant imagery by appending "food" to the query.
     """
     try:
-        colorful_query = f"{query} colorful"
+        food_query = f"{query} food"
         resp = requests.get(
             _PEXELS_IMAGE_SEARCH,
             headers=_pexels_headers(),
-            params={"query": colorful_query, "per_page": 3, "orientation": "portrait", "size": "large"},
+            params={"query": food_query, "per_page": 3, "orientation": "portrait", "size": "large"},
             timeout=15,
         )
         resp.raise_for_status()
@@ -162,6 +332,33 @@ def _search_pexels_image(query: str) -> str | None:
             return photos[0]["src"].get("large2x", photos[0]["src"]["large"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("Pexels image search failed for '%s': %s", query, exc)
+    return None
+
+
+def _search_unsplash_image(query: str) -> str | None:
+    """Return the URL of a portrait food photo from Unsplash for *query*.
+
+    Requires ``UNSPLASH_ACCESS_KEY`` to be set; returns None gracefully
+    if the key is absent or the request fails.
+    """
+    api_key = getattr(config, "UNSPLASH_ACCESS_KEY", None)
+    if not api_key:
+        return None
+    try:
+        resp = requests.get(
+            _UNSPLASH_SEARCH,
+            headers={"Authorization": f"Client-ID {api_key}"},
+            params={"query": query, "per_page": 3, "orientation": "portrait"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        results = data.get("results", [])
+        if results:
+            urls_obj = results[0].get("urls", {})
+            return urls_obj.get("regular") or urls_obj.get("full")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unsplash image search failed for '%s': %s", query, exc)
     return None
 
 
@@ -391,7 +588,14 @@ def _build_caption_clips(script_text: str, total_duration: float, video_w: int, 
     glow_color_hex = getattr(config, "SUBTITLE_GLOW_COLOR", "#FFD700")
     glow_radius    = getattr(config, "SUBTITLE_GLOW_RADIUS", 18)
     all_caps       = getattr(config, "SUBTITLE_ALL_CAPS", True)
-    font_name      = getattr(config, "SUBTITLE_FONT", "Liberation-Sans-Bold")
+    font_fallbacks = [getattr(config, "SUBTITLE_FONT", "Liberation-Sans-Bold")]
+    font_fallbacks.extend(getattr(config, "SUBTITLE_FONT_FALLBACKS", []))
+    seen_fonts: set[str] = set()
+    ordered_fonts: list[str] = []
+    for f in font_fallbacks:
+        if f and f not in seen_fonts:
+            ordered_fonts.append(f)
+            seen_fonts.add(f)
     stroke_w       = getattr(config, "SUBTITLE_STROKE_WIDTH", 6)
     base_font_size = getattr(config, "SUBTITLE_FONT_SIZE", 92)
 
@@ -411,17 +615,40 @@ def _build_caption_clips(script_text: str, total_duration: float, video_w: int, 
         )
 
         try:
-            txt_clip = TextClip(
-                display_text,
-                fontsize=font_size,
-                font=font_name,
-                color=color,
-                stroke_color="black",
-                stroke_width=stroke_w,
-                method="caption",
-                size=(video_w - 120, None),
-                align="center",
-            )
+            txt_clip = None
+            chosen_font: str | None = None
+            last_font_exc: Exception | None = None
+            for candidate_font in ordered_fonts:
+                try:
+                    txt_clip = TextClip(
+                        display_text,
+                        fontsize=font_size,
+                        font=candidate_font,
+                        color=color,
+                        stroke_color="black",
+                        stroke_width=stroke_w,
+                        method="caption",
+                        size=(video_w - 120, None),
+                        align="center",
+                    )
+                    chosen_font = candidate_font
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_font_exc = exc
+                    logger.debug(
+                        "Subtitle font '%s' unavailable (%s): %s",
+                        candidate_font,
+                        type(exc).__name__,
+                        exc,
+                    )
+            if txt_clip is None:
+                logger.warning(
+                    "Subtitle clip %d skipped: no usable subtitle font (%s: %s)",
+                    i,
+                    type(last_font_exc).__name__ if last_font_exc else "UnknownError",
+                    last_font_exc,
+                )
+                continue
             txt_w, txt_h = txt_clip.size
             pad_x, pad_y = 36, 20
 
@@ -455,7 +682,7 @@ def _build_caption_clips(script_text: str, total_duration: float, video_w: int, 
                 TextClip(
                     display_text,
                     fontsize=font_size,
-                    font=font_name,
+                    font=chosen_font,
                     color="#000000",
                     stroke_color="#000000",
                     stroke_width=stroke_w + 2,
@@ -497,21 +724,26 @@ def create_video(
     scenes: list[str],
     audio_duration: float,
     hook_text: str = "",
+    music_path: Path | None = None,
 ) -> Path:
-    """Create a vertical 1080 × 1920 YouTube Shorts MP4 comedy animation video.
+    """Create a vertical 1080 × 1920 YouTube Shorts MP4 food making video.
 
-    Fetches animation-themed stock footage (colorful, cartoon-like searches),
-    applies vibrant colour grading, adds meme-style captions, and exports a
-    polished comedy short.
+    Fetches food-themed stock footage from Pexels, Pixabay, and Unsplash,
+    applies warm vibrant colour grading, adds engaging captions, and exports a
+    polished food short optimised for YouTube Shorts.
 
     Args:
         audio_path:     Path to the TTS MP3 audio file.
         script_text:    Full narration script (hook + body + CTA).  Every
                         spoken word is captioned in a single lower-third band.
-        scenes:         List of scene description strings (used as Pexels
-                        search queries, animation-enhanced).
+        scenes:         List of scene description strings (used as food stock
+                        search queries for Pexels, Pixabay, and Unsplash).
         audio_duration: Duration in seconds of the TTS audio.
         hook_text:      Kept for API compatibility.
+        music_path:     Optional path to a background music MP3 supplied by
+                        the pipeline (e.g. downloaded via music_selector).
+                        When ``None``, falls back to the static
+                        ``BG_MUSIC_PATH`` from config if it exists.
 
     Returns:
         Path to the exported MP4 file.
@@ -527,7 +759,9 @@ def create_video(
             ColorClip,
             ImageClip,
             VideoFileClip,
+            afx,
             concatenate_videoclips,
+            vfx,
         )
     except ImportError as exc:
         raise RuntimeError("moviepy is not installed") from exc
@@ -539,11 +773,11 @@ def create_video(
     video_clips: list[Any] = []
 
     try:
-        # ------------------------------------------------------------------
-        # 1. Fetch animation-themed stock footage for each scene
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 1. Fetch food-themed stock footage for each scene
+    # ------------------------------------------------------------------
         time_per_scene = target_duration / max(len(scenes), 1)
-        for scene in scenes:
+        for scene_idx, scene in enumerate(scenes):
             clip_added = False
 
             video_urls = _search_pexels_video(scene, per_page=5)
@@ -551,7 +785,7 @@ def create_video(
                 try:
                     clip_path = _download_file(url, ".mp4")
                     downloaded.append(clip_path)
-                    vc = VideoFileClip(str(clip_path), audio=False)
+                    vc = _load_safe_video_clip(VideoFileClip, clip_path)
                     scene_dur = time_per_scene + transition_dur
                     if vc.duration < scene_dur:
                         loops = math.ceil(scene_dur / vc.duration)
@@ -573,7 +807,12 @@ def create_video(
                     logger.warning("Failed to load video from Pexels: %s", exc)
 
             if not clip_added:
-                img_url = _search_pexels_image(scene)
+                # Try Unsplash as additional image fallback
+                unsplash_url = _search_unsplash_image(f"{scene} food")
+                if not unsplash_url:
+                    img_url = _search_pexels_image(scene)
+                else:
+                    img_url = unsplash_url
                 if img_url:
                     try:
                         img_path = _download_file(img_url, ".jpg")
@@ -585,13 +824,41 @@ def create_video(
                         video_clips.append(ic)
                         clip_added = True
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("Failed to load image from Pexels: %s", exc)
+                        logger.warning("Failed to load image from stock source: %s", exc)
 
             if not clip_added:
-                logger.warning("No footage for scene '%s'; using colorful gradient placeholder", scene)
+                logger.warning("No footage for scene '%s'; trying alternative sources", scene)
+                # Try footage_alternatives (Coverr, Videvo, AI placeholder)
+                try:
+                    from src.footage_alternatives import fetch_fallback_clip  # noqa: PLC0415
+
+                    scene_dur = time_per_scene + transition_dur
+                    alt_path = fetch_fallback_clip(
+                        scene_description=scene,
+                        duration=scene_dur,
+                        width=w,
+                        height=h,
+                        scene_index=scene_idx,
+                    )
+                    if alt_path and alt_path.suffix.lower() == ".mp4":
+                        downloaded.append(alt_path)
+                        vc = _load_safe_video_clip(VideoFileClip, alt_path)
+                        if vc.duration < scene_dur:
+                            loops = math.ceil(scene_dur / vc.duration)
+                            vc = vc.loop(n=loops)
+                        vc = vc.subclip(0, scene_dur)
+                        vc = _resize_clip(vc, w, h)
+                        video_clips.append(vc)
+                        clip_added = True
+                        logger.info("Used alternative footage source for scene '%s'", scene)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Footage alternatives failed for scene '%s': %s", scene, exc)
+
+            if not clip_added:
+                logger.warning("No footage for scene '%s'; using warm gradient placeholder", scene)
                 scene_dur = time_per_scene + transition_dur
-                # Use a bright, vibrant placeholder for animation feel
-                placeholder = ColorClip(size=(w, h), color=(60, 20, 120)).set_duration(scene_dur)
+                # Warm food-themed gradient placeholder
+                placeholder = ColorClip(size=(w, h), color=(180, 80, 20)).set_duration(scene_dur)
                 video_clips.append(placeholder)
 
         # ------------------------------------------------------------------
@@ -616,16 +883,23 @@ def create_video(
         # 3. Overlay TTS audio (mixed with optional background music)
         # ------------------------------------------------------------------
         tts_audio = AudioFileClip(str(audio_path))
+        target_duration = _resolve_target_duration(
+            requested_audio_duration=audio_duration,
+            default_duration=config.VIDEO_DURATION_TARGET,
+            measured_tts_duration=getattr(tts_audio, "duration", None),
+        )
 
-        bg_music_path = Path(config.BG_MUSIC_PATH)
-        if bg_music_path.exists() and config.BG_MUSIC_VOLUME > 0:
+        base = _fit_base_video_duration(base, target_duration, vfx)
+
+        # Prefer dynamically-supplied music_path; fall back to static BG_MUSIC_PATH
+        effective_music_path = music_path if music_path is not None else Path(config.BG_MUSIC_PATH)
+
+        if effective_music_path.exists() and config.BG_MUSIC_VOLUME > 0:
             try:
-                bg_audio = (
-                    AudioFileClip(str(bg_music_path))
-                    .volumex(config.BG_MUSIC_VOLUME)
-                    .set_duration(target_duration)
-                )
-                bg_audio = bg_audio.audio_fadein(1.0).audio_fadeout(2.0)
+                fade_dur = getattr(config, "MUSIC_FADE_DURATION", 1.0)
+                bg_audio = AudioFileClip(str(effective_music_path)).volumex(config.BG_MUSIC_VOLUME)
+                bg_audio = _fit_bg_audio_to_duration(bg_audio, target_duration, afx)
+                bg_audio = bg_audio.audio_fadein(fade_dur).audio_fadeout(fade_dur * 2)
                 mixed_audio = CompositeAudioClip([bg_audio, tts_audio])
                 base = base.set_audio(mixed_audio)
                 logger.info("Background music mixed in at volume %.2f", config.BG_MUSIC_VOLUME)
@@ -636,7 +910,7 @@ def create_video(
             base = base.set_audio(tts_audio)
 
         # ------------------------------------------------------------------
-        # 4. Build meme-style captions — bold comedy colours, neon glow pills
+        # 4. Build engaging captions — bold warm-toned word bursts for food content
         # ------------------------------------------------------------------
         caption_clips = _build_caption_clips(
             script_text, target_duration, w, h, start_offset=0.0
@@ -657,34 +931,45 @@ def create_video(
         final = CompositeVideoClip(layers, size=(w, h)) if len(layers) > 1 else base
 
         # ------------------------------------------------------------------
-        # 5b. Animation-style colour grade — brighter, more saturated palette
-        #     Boosts saturation and contrast for the cartoon/animation look.
+        # 5b. Warm food colour grade — vibrant, appetising palette
+        #     Boosts warm tones (reds and ambers) for appetite appeal.
         # ------------------------------------------------------------------
         if getattr(config, "VIDEO_COLOR_GRADE", True):
             try:
                 import numpy as np
 
                 def _animation_grade_frame(frame: Any) -> Any:
-                    """Apply a vibrant animation-style colour grade.
+                    """Apply Shorts color grade.
 
-                    Boosts saturation and contrast to give a brighter, more
-                    cartoon-like look compared to flat stock footage.
+                    Uses filmic contrast and warmer channel balancing when
+                    ``VIDEO_CINEMATIC_LOOK`` is enabled (default). Falls back
+                    to the legacy warm grade when it is disabled.
                     """
                     f = frame.astype("float32") / 255.0
-                    # Stronger S-curve contrast for punchy animation feel
-                    f = np.clip(f * 1.12 - 0.06, 0.0, 1.0)
-                    # Saturation boost: push colours away from grey (luminance 0.299R + 0.587G + 0.114B)
+                    if getattr(config, "VIDEO_CINEMATIC_LOOK", True):
+                        # Filmic contrast curve.
+                        f = np.clip(f * 1.16 - 0.08, 0.0, 1.0)
+                        sat_boost = 1.30
+                    else:
+                        # Legacy warm grade for compatibility.
+                        f = np.clip(f * 1.12 - 0.06, 0.0, 1.0)
+                        sat_boost = 1.25
+
                     lum = (0.299 * f[:, :, 0] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 2])
                     lum = lum[:, :, np.newaxis]
-                    sat_boost = 1.25
                     f = np.clip(lum + sat_boost * (f - lum), 0.0, 1.0)
-                    # Warm-cool comic tint: warm reds, cool blues stay vivid
-                    f[:, :, 0] = np.clip(f[:, :, 0] * 1.05, 0.0, 1.0)  # red channel boost
-                    f[:, :, 1] = np.clip(f[:, :, 1] * 1.02, 0.0, 1.0)  # green slight boost
+                    if getattr(config, "VIDEO_CINEMATIC_LOOK", True):
+                        # Warm cinematic tint: stronger amber highlights, restrained shadows.
+                        f[:, :, 0] = np.clip(f[:, :, 0] * 1.08, 0.0, 1.0)
+                        f[:, :, 1] = np.clip(f[:, :, 1] * 1.03, 0.0, 1.0)
+                        f[:, :, 2] = np.clip(f[:, :, 2] * 0.96, 0.0, 1.0)  # reduce blue for warmer filmic look
+                    else:
+                        f[:, :, 0] = np.clip(f[:, :, 0] * 1.05, 0.0, 1.0)
+                        f[:, :, 1] = np.clip(f[:, :, 1] * 1.02, 0.0, 1.0)
                     return (f * 255).astype("uint8")
 
                 final = final.fl_image(_animation_grade_frame)
-                logger.debug("Animation colour grade applied (saturation boost + vibrant contrast)")
+                logger.debug("Food colour grade applied (warm tone boost + vibrant contrast)")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Colour grade skipped: %s", exc)
 

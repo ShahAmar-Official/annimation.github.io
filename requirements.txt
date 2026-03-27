@@ -1,5 +1,5 @@
-gTTS>=2.5.0
 edge-tts>=7.0.0
+gtts>=2.5.0
 google-api-python-client>=2.118.0
 google-auth>=2.28.0
 google-auth-oauthlib>=1.2.0
@@ -10,3 +10,4 @@ pydub>=0.25.1
 requests>=2.31.0
 mutagen>=1.47.0
 numpy>=1.24.0
+httpx>=0.25.0

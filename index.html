@@ -787,33 +787,28 @@
     <div id="how-it-works" class="fade-in">
       <div class="section-header">
         <h2>🎬 How It Works</h2>
-        <p>Six automated steps — from comedy topic to viral animated Short</p>
+        <p>Five automated steps — from food topic to cinematic viral Short</p>
       </div>
       <div class="pipeline-grid">
         <div class="pipeline-step">
-          <div class="icon">🎭</div>
-          <strong>Find Comedy Gold</strong>
-          <div class="desc">Trending topics + comedy scoring</div>
+          <div class="icon">🔍</div>
+          <strong>Find Trending Topics</strong>
+          <div class="desc">Trending topics + virality scoring</div>
         </div>
         <div class="pipeline-step">
           <div class="icon">✍️</div>
-          <strong>Write Jokes</strong>
-          <div class="desc">AI comedy script engine</div>
+          <strong>AI Script &amp; Recipe</strong>
+          <div class="desc">Real steps, ingredients &amp; exact cook times from AI</div>
         </div>
         <div class="pipeline-step">
           <div class="icon">🎙️</div>
-          <strong>Voice Acting</strong>
+          <strong>Voice Narration</strong>
           <div class="desc">Expressive neural TTS</div>
         </div>
         <div class="pipeline-step">
           <div class="icon">🎬</div>
-          <strong>Animate It</strong>
-          <div class="desc">Cartoon-style video assembly</div>
-        </div>
-        <div class="pipeline-step">
-          <div class="icon">🖼️</div>
-          <strong>Eye-Candy Thumbnail</strong>
-          <div class="desc">Viral comedy thumbnails</div>
+          <strong>Assemble Video</strong>
+          <div class="desc">Stock footage + captions + music</div>
         </div>
         <div class="pipeline-step">
           <div class="icon">🚀</div>
@@ -835,7 +830,7 @@
         <div class="feature-card">
           <div class="feature-icon">💸</div>
           <h3>Completely Free</h3>
-          <p>No paid APIs. Uses Google TTS, template scripts, and free Pexels stock footage.</p>
+          <p>No paid APIs. Uses Google TTS, AI-powered scripts, and free Pexels stock footage.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">🤖</div>
@@ -853,9 +848,14 @@
           <p>Vertical 1080×1920 video with captions, hooks, and CTAs built in.</p>
         </div>
         <div class="feature-card">
+          <div class="feature-icon">🍳</div>
+          <h3>AI-Generated Steps &amp; Timing</h3>
+          <p>Real preparation steps and accurate cook times sourced live from AI — not static templates.</p>
+        </div>
+        <div class="feature-card">
           <div class="feature-icon">🎨</div>
-          <h3>Custom Thumbnails</h3>
-          <p>Auto-generated gradient thumbnails with topic emojis and bold typography.</p>
+          <h3>Cinematic Visual Look</h3>
+          <p>Warm filmic color grading, punchy contrast, and polished visual finishing.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">🔄</div>
@@ -1094,6 +1094,60 @@ PEXELS_API_KEY         → Your free Pexels API key</pre>
             The pipeline runs every 6 hours automatically.
           </li>
         </ol>
+      </div>
+
+      <!-- Optional: Music API Keys -->
+      <div class="card fade-in" id="music-sources-card">
+        <h2>🎵 Free Music Sources &amp; Fallbacks</h2>
+        <p class="card-description">
+          Background music is sourced automatically using a multi-source fallback chain — no manual
+          configuration required. Each source is tried in order until one succeeds.
+        </p>
+        <table class="cost-table" style="margin-top:1rem;">
+          <thead>
+            <tr>
+              <th>Priority</th>
+              <th>Source</th>
+              <th>API Key Required</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1️⃣ Primary</td>
+              <td><a href="https://pixabay.com/api/docs/" target="_blank" rel="noopener">Pixabay Music</a></td>
+              <td><code>PIXABAY_API_KEY</code> <em>(optional)</em></td>
+              <td>High-quality royalty-free tracks</td>
+            </tr>
+            <tr>
+              <td>2️⃣ Secondary</td>
+              <td><a href="https://freemusicarchive.org" target="_blank" rel="noopener">Free Music Archive</a></td>
+              <td><span class="free-badge">None needed</span></td>
+              <td>Creative Commons licensed music</td>
+            </tr>
+            <tr>
+              <td>3️⃣ Optional</td>
+              <td><a href="https://freesound.org/apiv2/apply/" target="_blank" rel="noopener">Freesound</a></td>
+              <td><code>FREESOUND_API_KEY</code> <em>(optional)</em></td>
+              <td>Large community sound library</td>
+            </tr>
+            <tr>
+              <td>4️⃣ Fallback</td>
+              <td>Silence Generator</td>
+              <td><span class="free-badge">None needed</span></td>
+              <td>Always succeeds — guarantees an audio track</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="margin-top:1rem; font-size:0.88rem; color:var(--text-secondary);">
+          💡 <strong>Tip:</strong> Add the optional secrets below to unlock higher-quality music sources.
+          If none are configured, the pipeline still works using Free Music Archive and the silence fallback.
+        </p>
+        <div class="token-box" style="margin-top:0.75rem;">
+          <label>Optional music secrets (add to GitHub Secrets → Actions)</label>
+          <pre>PIXABAY_API_KEY     → Free at <a href="https://pixabay.com/api/docs/" target="_blank" rel="noopener" style="color:var(--accent-light)">pixabay.com/api/docs</a>
+FREESOUND_API_KEY   → Free at <a href="https://freesound.org/apiv2/apply/" target="_blank" rel="noopener" style="color:var(--accent-light)">freesound.org/apiv2/apply</a></pre>
+        </div>
       </div>
     </div>
 
